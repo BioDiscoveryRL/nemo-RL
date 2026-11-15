@@ -577,7 +577,11 @@ class AsyncTrajectoryCollector:
                         ),
                         self._efficiency_timer.time("idle/generation_limit_pause"),
                     ):
-                        self._generation_limit_cleared.wait()
+                        # With refill dynamic sampling, also re-check periodically: a worker's wake-up that lands
+                        # between the pause check and clear() above would otherwise be lost.
+                        self._generation_limit_cleared.wait(
+                            timeout=30.0 if self._drop_groups_without_signal else None
+                        )
 
                     # Double-check we're still running after being woken up
                     if not self.running:
@@ -1632,6 +1636,10 @@ class AsyncTrajectoryCollector:
             with self._failure_lock:
                 if self._fatal_error_message is None:
                     self._failure_count = 0
+            # Groups dropped for no reward signal leave the target short. Wake the collection loop once this
+            # reservation is released, so it gap-fills the target instead of waiting for a weight update that
+            # cannot come until the target is complete.
+            wake_generation_limits_after_cleanup = self._drop_groups_without_signal
         except Exception as error:
             if not self.running:
                 return
