@@ -15,19 +15,29 @@
 """A long-lived 8-GPU Modal Sandbox for iterating on training without rebuilding the image.
 
 The Sandbox uses the same image, volumes and secret as modal_app.py. Start it once, push local edits with `sync`
-(only files changed since the last sync), and rerun commands with `run`. It stops after 30 idle minutes.
+(only files changed since the last sync), and start commands with `run`.
+
+`run` is detached: the command keeps running in the Sandbox when this client exits or the laptop sleeps, and its
+output goes to /results/devbox-logs/<name>.log on the results Volume (with <name>.exit once it ends), so the log
+outlives the Sandbox. A running command counts as Sandbox activity; the Sandbox stops after 30 idle minutes once
+nothing runs.
 
     uv run --no-project --with modal python examples/nemo_gym/target_rl/modal_devbox.py up   # published image, then sync
     uv run --no-project --with modal python examples/nemo_gym/target_rl/modal_devbox.py sync
     uv run --no-project --with modal python examples/nemo_gym/target_rl/modal_devbox.py run "examples/nemo_gym/target_rl/train.sh ++grpo.max_num_steps=3"
+    uv run --no-project --with modal python examples/nemo_gym/target_rl/modal_devbox.py logs --follow
+    uv run --no-project --with modal python examples/nemo_gym/target_rl/modal_devbox.py stop
     uv run --no-project --with modal python examples/nemo_gym/target_rl/modal_devbox.py status
     uv run --no-project --with modal python examples/nemo_gym/target_rl/modal_devbox.py down
+
+A run's log after the Sandbox is gone: modal volume get target-rl-results devbox-logs/<name>.log
 """
 
 import argparse
 import importlib.util
 import io
 import json
+import shlex
 import sys
 import tarfile
 import time
@@ -42,6 +52,7 @@ IDLE_MINUTES = 30
 HOURS = 60 * 60
 SKIP_DIRS = {".git", ".venv", "__pycache__", "results", "logs", ".cache", "cache"}
 SKIP_FILES = {"env.yaml"}
+LOG_DIR = "/results/devbox-logs"
 
 
 def load_modal_app():
@@ -138,18 +149,90 @@ def sync(_: argparse.Namespace) -> None:
     print(f"Synced {count} files.")
 
 
+def exec_output(sandbox: modal.Sandbox, command: str) -> str:
+    process = sandbox.exec("bash", "-c", command)
+    process.wait()
+    return process.stdout.read().strip()
+
+
+def run_paths(name: str) -> tuple[str, str, str]:
+    base = f"{LOG_DIR}/{name}"
+    return f"{base}.log", f"{base}.exit", f"{base}.pid"
+
+
+def run_state(sandbox: modal.Sandbox, name: str) -> str:
+    """'running', 'exited N', or 'unknown' for the named run."""
+    log, exit_file, pid_file = run_paths(name)
+    return exec_output(
+        sandbox,
+        f"if [ -s {exit_file} ]; then echo exited $(cat {exit_file}); "
+        f"elif [ -s {pid_file} ] && kill -0 $(cat {pid_file}) 2>/dev/null; then echo running; else echo unknown; fi",
+    )
+
+
 def run(args: argparse.Namespace) -> None:
     sandbox = sandbox_from_state()
     m = load_modal_app()
+    state = read_state()
+    if state.get("run") and run_state(sandbox, state["run"]) == "running":
+        raise SystemExit(f"Run {state['run']} is still running; `stop` it first.")
+    name = args.name or time.strftime("run-%Y%m%d-%H%M%S")
+    log, exit_file, pid_file = run_paths(name)
     command = f"HF_HOME={m.CACHE}/huggingface RESULTS_ROOT={m.RESULTS} {args.command}"
-    process = sandbox.exec("bash", "-lc", command, workdir=m.REMOTE_NEMO_RL)
-    for line in process.stdout:
-        print(line, end="", flush=True)
-    process.wait()
-    stderr = process.stderr.read()
-    if stderr:
-        print(stderr, end="", file=sys.stderr)
-    sys.exit(process.returncode)
+    # setsid gives the run its own process group, which `stop` kills as a whole. The Volume `sync` makes the log
+    # and exit code visible outside the Sandbox without waiting for it to stop.
+    wrapper = (
+        f"mkdir -p {LOG_DIR} && rm -f {exit_file} && echo $$ > {pid_file} && cd {m.REMOTE_NEMO_RL} && "
+        f"{{ bash -lc {shlex.quote(command)}; }} > {log} 2>&1; echo $? > {exit_file}; sync {m.RESULTS} || true"
+    )
+    # Not waited on: the process lives in the Sandbox, not in this client.
+    sandbox.exec("setsid", "bash", "-c", wrapper)
+    write_state({**state, "run": name})
+    print(f"Started {name}; log at {log}")
+    if args.follow:
+        time.sleep(2)
+        follow(sandbox, name, lines=200)
+
+
+def follow(sandbox: modal.Sandbox, name: str, lines: int) -> None:
+    log, _, pid_file = run_paths(name)
+    # tail stops when the run's wrapper exits; Ctrl-C stops only this client, never the run.
+    process = sandbox.exec(
+        "bash", "-c", f"tail -n {lines} -F {log} --pid=$(cat {pid_file} 2>/dev/null || echo 1) 2>/dev/null"
+    )
+    try:
+        for line in process.stdout:
+            print(line, end="", flush=True)
+    except KeyboardInterrupt:
+        pass
+    print(f"[{name}: {run_state(sandbox, name)}]")
+
+
+def logs(args: argparse.Namespace) -> None:
+    sandbox = sandbox_from_state()
+    name = args.name or read_state().get("run")
+    if not name:
+        raise SystemExit("No run recorded; pass --name.")
+    if args.follow:
+        follow(sandbox, name, lines=args.lines)
+    else:
+        print(exec_output(sandbox, f"tail -n {args.lines} {run_paths(name)[0]}"))
+        print(f"[{name}: {run_state(sandbox, name)}]")
+
+
+def stop(args: argparse.Namespace) -> None:
+    sandbox = sandbox_from_state()
+    name = args.name or read_state().get("run")
+    if not name:
+        raise SystemExit("No run recorded; pass --name.")
+    _, _, pid_file = run_paths(name)
+    # The run's process group, then Ray, whose daemons outlive their parent.
+    exec_output(
+        sandbox,
+        f"[ -s {pid_file} ] && kill -TERM -- -$(cat {pid_file}) 2>/dev/null; sleep 10; "
+        f"[ -s {pid_file} ] && kill -KILL -- -$(cat {pid_file}) 2>/dev/null; ray stop --force >/dev/null 2>&1; true",
+    )
+    print(f"Stopped {name}: {run_state(sandbox, name)}")
 
 
 def status(_: argparse.Namespace) -> None:
@@ -157,8 +240,11 @@ def status(_: argparse.Namespace) -> None:
     if "sandbox_id" not in state:
         print("No devbox recorded.")
         return
-    code = modal.Sandbox.from_id(state["sandbox_id"]).poll()
+    sandbox = modal.Sandbox.from_id(state["sandbox_id"])
+    code = sandbox.poll()
     print(f"{state['sandbox_id']}: {'running' if code is None else f'stopped (exit {code})'}")
+    if code is None and state.get("run"):
+        print(f"last run {state['run']}: {run_state(sandbox, state['run'])}")
 
 
 def down(_: argparse.Namespace) -> None:
@@ -177,9 +263,19 @@ def main() -> None:
     up_parser.set_defaults(handler=up)
     for name, handler in (("sync", sync), ("status", status), ("down", down)):
         sub.add_parser(name).set_defaults(handler=handler)
-    run_parser = sub.add_parser("run")
+    run_parser = sub.add_parser("run", help="start a command in the devbox, detached")
     run_parser.add_argument("command")
+    run_parser.add_argument("--name", help="run name for the log file (default: run-<timestamp>)")
+    run_parser.add_argument("--follow", action="store_true", help="stream the log after starting")
     run_parser.set_defaults(handler=run)
+    logs_parser = sub.add_parser("logs", help="show the last run's log")
+    logs_parser.add_argument("--name")
+    logs_parser.add_argument("-n", "--lines", type=int, default=100)
+    logs_parser.add_argument("--follow", action="store_true")
+    logs_parser.set_defaults(handler=logs)
+    stop_parser = sub.add_parser("stop", help="stop the last run")
+    stop_parser.add_argument("--name")
+    stop_parser.set_defaults(handler=stop)
     args = parser.parse_args()
     args.handler(args)
 
