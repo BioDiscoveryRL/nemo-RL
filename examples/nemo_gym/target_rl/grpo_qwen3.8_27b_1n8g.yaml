@@ -1,0 +1,99 @@
+# GRPO for Qwen3.8-27B (thinking) on NeMo Gym environments, one node of 8 GPUs.
+#
+# Model and parallelism follow examples/configs/recipes/llm/grpo-qwen3.8-27b-2n8g-megatron-tp4pp2cp2.yaml.
+# That recipe trains every weight on two nodes; this one fits one node with LoRA (TP4 x PP2 = 8 GPUs).
+# For a full fine-tune on two nodes: ++policy.megatron_cfg.peft.enabled=false ++cluster.num_nodes=2
+# ++policy.megatron_cfg.context_parallel_size=2 ++policy.sequence_packing.enabled=true.
+#
+# The Gym environment is the toy tool-calling server (example_single_tool_call) until the drug-target
+# environment lands; swap config_paths and data paths to train on it.
+
+defaults: "../grpo_workplace_assistant_nemotron_nano_v2_9b.yaml"
+
+grpo:
+  # The smoke dataset holds 5 tasks; raise this with the real dataset (contracts.BatchManifest uses 64).
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 8
+  val_period: 10
+  val_at_start: false
+
+checkpointing:
+  checkpoint_dir: results/target-rl-qwen3.8-27b-1n8g
+  metric_name: "val:accuracy"
+  save_period: 10
+
+policy:
+  model_name: Qwen/Qwen3.8-27B
+  tokenizer:
+    chat_template_kwargs:
+      enable_thinking: true
+  max_total_sequence_length: 32768
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+
+  megatron_cfg:
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 2
+    context_parallel_size: 1
+    sequence_parallel: true
+    activation_checkpointing: true
+    apply_rope_fusion: false
+    defer_fp32_logits: true
+    # Required by MegatronConfig; the inherited Gym tutorial config predates the field. Dense model, so off.
+    moe_per_layer_logging: false
+    peft:
+      enabled: true
+      target_modules: []
+      exclude_modules: []
+      dim: 128
+      alpha: 128
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init_method: "xavier"
+      lora_B_init_method: "zero"
+      a2a_experimental: false
+      lora_dtype: None
+      restore_from: null
+
+  generation:
+    lora_refit_mode: merged
+    vllm_cfg:
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.6
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: qwen3
+
+data:
+  train:
+    data_path: 3rdparty/Gym-workspace/Gym/target_rl/data/smoke/train.jsonl
+  validation:
+    data_path: 3rdparty/Gym-workspace/Gym/target_rl/data/smoke/validation.jsonl
+
+env:
+  nemo_gym:
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/example_single_tool_call/configs/example_single_tool_call.yaml
+    # The base recipe's environments; null reads as absent (an override cannot delete an inherited key).
+    workplace_assistant_environment_server: null
+    code_gen: null
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+          extra_body:
+            chat_template_kwargs:
+              enable_thinking: true
+
+logger:
+  log_dir: logs/target-rl-qwen3.8-27b-1n8g
+  wandb_enabled: false
+  tensorboard_enabled: true
+  wandb:
+    project: target-rl
+    name: qwen3.8-27b-1n8g
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
