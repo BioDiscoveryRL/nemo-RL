@@ -4,11 +4,12 @@
 # - Async GRPO with separate pools: 6 GPUs generate (vLLM TP2, three replicas), 2 GPUs train (Megatron TP2).
 #   Rollouts may be one step stale (max_trajectory_age_steps), corrected by importance sampling.
 # - Dr. GRPO advantages: reward minus the group mean, without dividing by the group std.
+# - Dynamic sampling: prompt groups whose rollouts all score the same (no advantage) are dropped and replaced by
+#   newly generated groups, so each batch holds num_prompts_per_step groups with signal (as PRIME-RL's orchestrator
+#   does with constant_trainer_batch_size).
 # Synchronous colocated training on all 8 GPUs instead: ++grpo.async_grpo.enabled=false
 #   ++policy.generation.colocated.enabled=true ++policy.megatron_cfg.pipeline_model_parallel_size=2
 #   ++policy.megatron_cfg.tensor_model_parallel_size=4 ++policy.generation.vllm_cfg.tensor_parallel_size=4
-#   (dynamic sampling, which drops groups whose rollouts all score the same, only applies in that mode:
-#   ++grpo.use_dynamic_sampling=true).
 #
 # Model and parallelism follow examples/configs/recipes/llm/grpo-qwen3.8-27b-2n8g-megatron-tp4pp2cp2.yaml, which
 # trains every weight on two nodes.
@@ -24,10 +25,13 @@ grpo:
   num_generations_per_prompt: 8
   val_period: 10
   val_at_start: false
-  # Dr. GRPO: mean-only advantage over the whole group (no std division, no leave-one-out baseline). Groups whose
-  # rollouts all score the same get zero advantage and so contribute no gradient.
+  # Dr. GRPO: mean-only advantage over the whole group (no std division, no leave-one-out baseline).
   normalize_rewards: false
   use_leave_one_out_baseline: false
+  # Drop groups without reward signal and generate replacements; collection stops with an error after
+  # dynamic_sampling_max_gen_batches x num_prompts_per_step dropped groups in a row.
+  use_dynamic_sampling: true
+  dynamic_sampling_max_gen_batches: 10
   async_grpo:
     enabled: true
     max_trajectory_age_steps: 1
