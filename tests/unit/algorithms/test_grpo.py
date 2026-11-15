@@ -9723,3 +9723,21 @@ def test_mask_groups_without_reward_signal_keeps_rows_when_no_group_has_signal()
     prompt_ids = torch.tensor([[0], [0], [1], [1]])
     assert grpo_mod._mask_groups_without_reward_signal(batch, prompt_ids) == 2
     assert batch["loss_multiplier"].tolist() == [1.0, 1.0, 1.0, 1.0]
+
+
+def test_dynamic_sampling_lag_metrics_reports_rollout_multiplier(capsys):
+    metrics = grpo_mod._dynamic_sampling_lag_metrics(
+        {"dropped_groups": 6, "kept_groups": 2, "consecutive_dropped_groups": 1}
+    )
+    assert metrics["dynamic_sampling/drop_fraction"] == 0.75
+    assert metrics["dynamic_sampling/rollouts_per_kept_group"] == 4.0
+    assert "Dynamic sampling lag" in capsys.readouterr().out
+
+
+def test_dynamic_sampling_lag_metrics_quiet_without_drops(capsys):
+    metrics = grpo_mod._dynamic_sampling_lag_metrics(
+        {"dropped_groups": 0, "kept_groups": 4, "consecutive_dropped_groups": 0}
+    )
+    assert metrics["dynamic_sampling/drop_fraction"] == 0.0
+    assert metrics["dynamic_sampling/rollouts_per_kept_group"] == 1.0
+    assert capsys.readouterr().out == ""

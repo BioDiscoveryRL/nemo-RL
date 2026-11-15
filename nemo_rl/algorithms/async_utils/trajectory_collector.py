@@ -240,6 +240,9 @@ class AsyncTrajectoryCollector:
             k: _threading.Lock() for k in self.teacher_worker_groups
         }
         self._consecutive_dropped_groups = 0
+        # Groups dropped and kept since the trainer last read them (pop_dynamic_sampling_metrics).
+        self._dropped_groups_since_report = 0
+        self._kept_groups_since_report = 0
         self._dropped_groups_lock: _threading.Lock = _threading.Lock()
         self.running = False
         self.data_exhausted = False
@@ -1203,6 +1206,18 @@ class AsyncTrajectoryCollector:
             self._efficiency_timer.get_timing_metrics(reduction_op="sum"),
         )
 
+    def pop_dynamic_sampling_metrics(self) -> dict[str, int]:
+        """Return and reset the prompt groups dropped and kept by refill dynamic sampling since the last call."""
+        with self._dropped_groups_lock:
+            metrics = {
+                "dropped_groups": self._dropped_groups_since_report,
+                "kept_groups": self._kept_groups_since_report,
+                "consecutive_dropped_groups": self._consecutive_dropped_groups,
+            }
+            self._dropped_groups_since_report = 0
+            self._kept_groups_since_report = 0
+        return metrics
+
     def flush_telemetry(self, quiesce_timeout_s: float = 5.0) -> None:
         """Stop collecting, then export whatever spans are still buffered here.
 
@@ -1712,6 +1727,7 @@ class AsyncTrajectoryCollector:
         """Skip a group whose rollouts all scored the same; the buffer's shortfall makes gap-filling replace it."""
         with self._dropped_groups_lock:
             self._consecutive_dropped_groups += 1
+            self._dropped_groups_since_report += 1
             dropped = self._consecutive_dropped_groups
         if dropped > self._max_consecutive_dropped_groups:
             raise RuntimeError(
@@ -1750,6 +1766,7 @@ class AsyncTrajectoryCollector:
                 return
             with self._dropped_groups_lock:
                 self._consecutive_dropped_groups = 0
+                self._kept_groups_since_report += 1
 
         # Teacher inference is blocking. Keep it off this worker's event loop so
         # other completed prompt groups can continue moving toward the buffer.

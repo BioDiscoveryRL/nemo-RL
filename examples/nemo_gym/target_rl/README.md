@@ -33,3 +33,18 @@ Model weights cache in the `target-rl-hf-cache` volume; logs and checkpoints lan
 
 - Training uses NeMo RL's own vLLM for generation; the SGLang endpoints on Modal are for inference checks only.
 - LoRA on the Qwen3.5 architecture in Megatron is not yet exercised by an upstream recipe; the first smoke run checks it. The upstream full fine-tune recipe for this model needs two nodes.
+
+## Watching dynamic sampling lag
+
+With `grpo.dynamic_sampling_refill: true` (the default), groups whose rollouts all score the same are dropped and
+regenerated, so a step can wait on many extra rollouts when most tasks are too easy or too hard. Each step logs:
+
+- `train/dynamic_sampling/rollouts_per_kept_group`: prompt groups generated per group trained on (1.0 = nothing
+  dropped, 3.0 = the step waited for three times the rollouts it trains on).
+- `train/dynamic_sampling/drop_fraction`, `dropped_groups`, `kept_groups`, `consecutive_dropped_groups`.
+
+Above 50% dropped, the log prints `⚠️ Dynamic sampling lag`; after `dynamic_sampling_max_gen_batches x
+num_prompts_per_step` drops in a row, collection stops with an error. `grep -E "Dynamic sampling lag|Dropped prompt
+group" <log>` shows both. If the lag stays high, set `++grpo.dynamic_sampling_refill=false` on the next run: steps then
+train on whichever groups had signal instead of waiting for replacements.
+

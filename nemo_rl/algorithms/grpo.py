@@ -2794,6 +2794,36 @@ def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int
     return num_masked
 
 
+# Above this share of dropped groups, refill needs more than twice the rollouts per training step.
+DYNAMIC_SAMPLING_LAG_WARNING_FRACTION = 0.5
+
+
+def _dynamic_sampling_lag_metrics(counts: dict[str, int]) -> dict[str, float]:
+    """Turn the collector's dropped/kept group counts into train metrics, warning when refill slows steps down.
+
+    ``rollouts_per_kept_group`` is how many prompt groups were generated per group trained on: 1.0 means no
+    group was dropped, 3.0 means each step waited for three times the rollouts it trains on.
+    """
+    dropped, kept = counts["dropped_groups"], counts["kept_groups"]
+    generated = dropped + kept
+    drop_fraction = dropped / generated if generated else 0.0
+    rollouts_per_kept_group = generated / kept if kept else float(generated)
+    if drop_fraction > DYNAMIC_SAMPLING_LAG_WARNING_FRACTION:
+        print(
+            f"  ⚠️ Dynamic sampling lag: dropped {dropped} of {generated} prompt groups since the last step "
+            f"({drop_fraction:.0%}), {rollouts_per_kept_group:.1f}x the rollouts per trained group; "
+            f"{counts['consecutive_dropped_groups']} consecutive drops so far",
+            flush=True,
+        )
+    return {
+        "dynamic_sampling/dropped_groups": dropped,
+        "dynamic_sampling/kept_groups": kept,
+        "dynamic_sampling/drop_fraction": drop_fraction,
+        "dynamic_sampling/rollouts_per_kept_group": rollouts_per_kept_group,
+        "dynamic_sampling/consecutive_dropped_groups": counts["consecutive_dropped_groups"],
+    }
+
+
 def _mask_groups_without_reward_signal(
     repeated_batch: BatchedDataDict[DatumSpec], prompt_ids: torch.Tensor
 ) -> int:
@@ -6782,6 +6812,15 @@ def async_grpo_train(
             collector_efficiency = ray.get(
                 trajectory_collector.get_efficiency_metrics.remote()
             )
+            if (
+                master_config.grpo.use_dynamic_sampling
+                and master_config.grpo.dynamic_sampling_refill
+            ):
+                metrics.update(
+                    _dynamic_sampling_lag_metrics(
+                        ray.get(trajectory_collector.pop_dynamic_sampling_metrics.remote())
+                    )
+                )
             driver_efficiency = {
                 cat: timer.reduce(cat, "sum")
                 for cat in WALL_CLOCK_EFFICIENCY_CATEGORIES
