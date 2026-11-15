@@ -87,6 +87,8 @@ image = (
     .add_local_dir(NEMO_RL.parent / "contracts", f"{GYM_WORKSPACE}/contracts", ignore=IGNORE, copy=True)
     .add_local_dir(NEMO_RL.parent / "generator", f"{GYM_WORKSPACE}/generator", ignore=IGNORE, copy=True)
     .run_commands(
+        # NeMo Gym builds with egg_base = "cache", a checked-in folder IGNORE leaves out.
+        f"mkdir -p {REMOTE_NEMO_GYM}/cache",
         UV_SYNC,
         # Second half of the actor venv build, as in docker/Dockerfile's release stage: the editable nemo_rl and
         # nemo_gym installs and the python-<Actor> wrappers, now that the source is here. The first half (every
