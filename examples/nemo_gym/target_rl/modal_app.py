@@ -35,7 +35,6 @@ REMOTE_NEMO_RL = "/opt/nemo-rl"
 REMOTE_NEMO_GYM = f"{REMOTE_NEMO_RL}/3rdparty/Gym-workspace/Gym"
 CACHE = "/cache"
 RESULTS = "/results"
-WORLDS = "/worlds"
 HOURS = 60 * 60
 
 # Local paths only exist on the machine that launches the app; inside the container the code is already in the image.
@@ -67,28 +66,12 @@ dependencies_image = (
     )
 )
 
-# The agent's analysis toolkit (what the task briefs promise) and the unprivileged user its commands run as.
-ANALYSIS = "/opt/analysis"
-PLINK2_URL = "https://s3.amazonaws.com/plink2-assets/beta1/plink2_linux_x86_64_20261107.zip"
-toolkit_image = (
-    dependencies_image.apt_install("bcftools", "tabix", "unzip", "curl")
-    .run_commands(
-        f"curl -fsSL -o /tmp/plink2.zip {PLINK2_URL} && unzip -q /tmp/plink2.zip -d /usr/local/bin"
-        " && chmod 0755 /usr/local/bin/plink2 && rm /tmp/plink2.zip",
-        f"uv venv -p 3.12 {ANALYSIS} && uv pip install -p {ANALYSIS}/bin/python pandas numpy scipy statsmodels"
-        " lifelines scikit-learn pyreadstat pyarrow polars duckdb cyvcf2 pysam matplotlib",
-        f"ln -s /usr/local/bin/plink2 /usr/bin/bcftools /usr/bin/tabix /usr/bin/bgzip {ANALYSIS}/bin/",
-        "useradd -m agent",
-    )
-    .env({"BDRL_WORLDS_ROOT": WORLDS, "BDRL_ANALYSIS_BIN": f"{ANALYSIS}/bin", "BDRL_AGENT_USER": "agent"})
-)
-
 # Then the checkouts, with the pinned BioDiscoveryRL repos beside NeMo Gym (the biodiscovery resources server depends
-# on ../../../{tasks,contracts,generator}); this sync only installs the projects themselves. Last, the agent user
-# loses read access to the code and task rows, which hold the answer keys.
+# on ../../../{tasks,contracts,generator}); this sync only installs the projects themselves. Agent commands run in
+# separate episode sandboxes (target_rl/configs/sandbox_modal.yaml), never in this container.
 GYM_WORKSPACE = f"{REMOTE_NEMO_RL}/3rdparty/Gym-workspace"
 image = (
-    toolkit_image.add_local_dir(NEMO_RL, REMOTE_NEMO_RL, ignore=IGNORE, copy=True)
+    dependencies_image.add_local_dir(NEMO_RL, REMOTE_NEMO_RL, ignore=IGNORE, copy=True)
     .add_local_dir(NEMO_GYM, REMOTE_NEMO_GYM, ignore=IGNORE, copy=True)
     .add_local_dir(NEMO_RL.parent / "tasks", f"{GYM_WORKSPACE}/tasks", ignore=IGNORE, copy=True)
     .add_local_dir(NEMO_RL.parent / "contracts", f"{GYM_WORKSPACE}/contracts", ignore=IGNORE, copy=True)
@@ -101,12 +84,11 @@ image = (
     )
 )
 
-# Mounted volumes keep their permissions from the volume, so they are closed to the agent user at container start.
+# Mounted volumes keep their permissions from the volume; checkpoints and caches stay private to the trainer.
 RESTRICT_VOLUMES = f"chmod 700 {CACHE} {RESULTS}"
 
 app = modal.App("target-rl-grpo")
 cache_volume = modal.Volume.from_name("target-rl-hf-cache", create_if_missing=True)
-worlds_volume = modal.Volume.from_name("target-rl-worlds", create_if_missing=True, version=2)
 results_volume = modal.Volume.from_name("target-rl-results", create_if_missing=True, version=2)
 
 
@@ -116,7 +98,7 @@ CONTAINER = dict(
     gpu="H100:8",
     cpu=64,
     memory=512 * 1024,
-    volumes={CACHE: cache_volume, RESULTS: results_volume, WORLDS: worlds_volume},
+    volumes={CACHE: cache_volume, RESULTS: results_volume},
     secrets=[modal.Secret.from_name("target-rl")],
 )
 

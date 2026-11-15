@@ -24,9 +24,12 @@ ACTOR_ENVIRONMENTS="$1"
 shift
 : "${NEMO_RL_VENV_DIR:?NEMO_RL_VENV_DIR must be set}"
 
-# sglang and trtllm actors are not used by these recipes; skipping them keeps the build short.
-"${UV_PROJECT_ENVIRONMENT:-/opt/nemo_rl_venv}/bin/python" "$ACTOR_ENVIRONMENTS" all sglang trtllm > /tmp/actor_venvs.tsv
-test -s /tmp/actor_venvs.tsv
+# Only the actors the target_rl recipes start (vLLM generation, Megatron policy, NeMo Gym and rollout actors); the
+# others (sglang, trtllm, modelopt, automodel, value and SFT workers) would each recompile CUDA extensions for nothing.
+KEEP='^nemo_rl\.(environments\.nemo_gym\.NemoGym|experience\.rollout_reassembler_actor\.RolloutReassemblerActor|experience\.sync_rollout_actor\.SyncRolloutActor|algorithms\.async_utils\.(AsyncTrajectoryCollector|ReplayBuffer)|models\.generation\.vllm\.vllm_worker(_async)?\.(VllmAsyncGenerationWorker|VllmGenerationWorker)|models\.policy\.workers\.megatron_policy_worker\.MegatronPolicyWorker)$'
+"${UV_PROJECT_ENVIRONMENT:-/opt/nemo_rl_venv}/bin/python" "$ACTOR_ENVIRONMENTS" all sglang trtllm \
+  | awk -F'\t' -v keep="$KEEP" '$1 ~ keep' > /tmp/actor_venvs.tsv
+test "$(wc -l < /tmp/actor_venvs.tsv)" -eq 8
 while IFS=$'\t' read -r venv_name stage extras; do
   venv_path="${NEMO_RL_VENV_DIR}/${venv_name}"
   uv venv --allow-existing "$venv_path"
