@@ -18,8 +18,13 @@ The volume keeps the dataset's own layout (worlds/<id>/{dbGaP,wgs}, shared/, har
 revision, so training containers mount the same files a dedicated box has under data/biodiscoveryrl/.
 Each world is committed as soon as it lands; rerunning skips worlds already present.
 
+`--split` then copies each world into its own Volume (target-rl-world-<id>) and the gene annotation into
+target-rl-genes, so an episode sandbox can mount exactly one world (biodiscovery `world_mounts`, Modal provider).
+The copy runs inside Modal, one short CPU Sandbox per world.
+
     modal run examples/nemo_gym/target_rl/modal_worlds.py                         # every world
     modal run examples/nemo_gym/target_rl/modal_worlds.py --worlds w930004,w933000
+    modal run examples/nemo_gym/target_rl/modal_worlds.py --split                 # stage, then one Volume per world
 
 Needs the `target-rl` Modal secret (HF_TOKEN).
 """
@@ -77,8 +82,33 @@ def stage(worlds: list[str]) -> dict[str, str]:
     return status
 
 
+WORLD_VOLUME = "target-rl-world-{world_id}"
+GENES_VOLUME = "target-rl-genes"
+
+
+def split_into_volumes(world_ids: list[str]) -> None:
+    """Copy each staged world into its own Volume and the gene annotation into another, in parallel."""
+    copies = {f"world {w}": (f"worlds/{w}", WORLD_VOLUME.format(world_id=w)) for w in world_ids}
+    copies["gene annotation"] = ("shared/genes", GENES_VOLUME)
+    sandboxes = {}
+    for label, (source, volume_name) in copies.items():
+        target = modal.Volume.from_name(volume_name, create_if_missing=True, version=2)
+        sandboxes[label] = modal.Sandbox.create(
+            "bash", "-c", f"cp -a /src/{source}/. /dst/ && sync && ls /dst",
+            app=app, image=image, volumes={"/src": worlds_volume.read_only(), "/dst": target}, timeout=2 * HOURS,
+        )
+    for label, sandbox in sandboxes.items():
+        sandbox.wait()
+        if sandbox.returncode != 0:
+            raise RuntimeError(f"copying {label} failed: {sandbox.stderr.read()}")
+        print(f"{label}: copied ({' '.join(sandbox.stdout.read().split())})")
+
+
 @app.local_entrypoint()
-def main(worlds: str = "") -> None:
+def main(worlds: str = "", split: bool = False) -> None:
     selected = [w.strip() for w in worlds.split(",") if w.strip()]
-    for world, state in stage.remote(selected).items():
+    status = stage.remote(selected)
+    for world, state in status.items():
         print(f"{world}: {state}")
+    if split:
+        split_into_volumes(sorted(status))

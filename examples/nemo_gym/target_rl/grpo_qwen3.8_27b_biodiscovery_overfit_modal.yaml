@@ -1,0 +1,21 @@
+# The overfitting test on Modal: episode sandboxes are Modal Sandboxes (no network, only the episode's world, read-only), since
+# Docker is unavailable inside Modal GPU containers. Everything else is grpo_qwen3.8_27b_biodiscovery_overfit.yaml.
+#
+# Quick check before a full run (2 tasks x 2 rollouts, one step):
+#   ++grpo.num_prompts_per_step=2 ++grpo.num_generations_per_prompt=2 ++grpo.max_num_steps=1 ++grpo.val_at_start=false
+
+defaults: "grpo_qwen3.8_27b_biodiscovery_overfit.yaml"
+
+env:
+  nemo_gym:
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/biodiscovery/configs/biodiscovery.yaml
+      - target_rl/configs/sandbox_modal.yaml
+    biodiscovery:
+      resources_servers:
+        biodiscovery:
+          # One Volume per world (modal_worlds.py --split), so an episode sees only its own world.
+          world_mounts:
+            - target-rl-world-{world_id}:/worlds/worlds/{world_id}:ro
+            - target-rl-genes:/worlds/shared/genes:ro

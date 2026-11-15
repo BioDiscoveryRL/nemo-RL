@@ -17,7 +17,7 @@
 The Sandbox uses the same image, volumes and secret as modal_app.py. Start it once, push local edits with `sync`
 (only files changed since the last sync), and rerun commands with `run`. It stops after 30 idle minutes.
 
-    uv run --no-project --with modal python examples/nemo_gym/target_rl/modal_devbox.py up
+    uv run --no-project --with modal python examples/nemo_gym/target_rl/modal_devbox.py up   # published image, then sync
     uv run --no-project --with modal python examples/nemo_gym/target_rl/modal_devbox.py sync
     uv run --no-project --with modal python examples/nemo_gym/target_rl/modal_devbox.py run "examples/nemo_gym/target_rl/train.sh ++grpo.max_num_steps=3"
     uv run --no-project --with modal python examples/nemo_gym/target_rl/modal_devbox.py status
@@ -36,6 +36,8 @@ from pathlib import Path
 import modal
 
 STATE = Path.home() / ".cache" / "target-rl" / "devbox.json"
+IMAGES = Path.home() / ".cache" / "target-rl" / "images.json"
+TRAINING_IMAGE = "target-rl-training"
 IDLE_MINUTES = 30
 HOURS = 60 * 60
 SKIP_DIRS = {".git", ".venv", "__pycache__", "results", "logs", ".cache", "cache"}
@@ -80,20 +82,27 @@ def changed_files(root: Path, since: float) -> list[Path]:
     return out
 
 
-def up(_: argparse.Namespace) -> None:
+def up(args: argparse.Namespace) -> None:
     state = read_state()
     if "sandbox_id" in state and modal.Sandbox.from_id(state["sandbox_id"]).poll() is None:
         print(f"Devbox already running: {state['sandbox_id']}")
         return
     m = load_modal_app()
     app = modal.App.lookup("target-rl-devbox", create_if_missing=True)
-    started = time.time()
+    # Start from the published image (modal_images.py) when there is one: no build, then sync what changed since.
+    published = json.loads(IMAGES.read_text()).get(TRAINING_IMAGE) if IMAGES.exists() else None
+    container = dict(m.CONTAINER)
+    if published and not args.build:
+        container["image"] = modal.Image.from_name(TRAINING_IMAGE)
+        started = published
+    else:
+        started = time.time()
     with modal.enable_output():  # streams the image build, if one is needed
         sandbox = modal.Sandbox.create(
             "sleep",
             "infinity",
             app=app,
-            **m.CONTAINER,
+            **container,
             workdir=m.REMOTE_NEMO_RL,
             timeout=24 * HOURS,
             idle_timeout=IDLE_MINUTES * 60,
@@ -102,6 +111,8 @@ def up(_: argparse.Namespace) -> None:
     restrict.wait()
     write_state({"sandbox_id": sandbox.object_id, "synced_at": started})
     print(f"Devbox up: {sandbox.object_id} (stops after {IDLE_MINUTES} idle minutes)")
+    if published and not args.build:
+        sync(args)
 
 
 def sync(_: argparse.Namespace) -> None:
@@ -161,7 +172,10 @@ def down(_: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="action", required=True)
-    for name, handler in (("up", up), ("sync", sync), ("status", status), ("down", down)):
+    up_parser = sub.add_parser("up")
+    up_parser.add_argument("--build", action="store_true", help="build the image from modal_app.py instead of the published one")
+    up_parser.set_defaults(handler=up)
+    for name, handler in (("sync", sync), ("status", status), ("down", down)):
         sub.add_parser(name).set_defaults(handler=handler)
     run_parser = sub.add_parser("run")
     run_parser.add_argument("command")
