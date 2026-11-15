@@ -9703,3 +9703,23 @@ def test_trainers_never_let_over_length_prompts_vote(
     counterfactual = all_rows[response] / all_rows[response].var(correction=0).sqrt()
     assert counterfactual.abs().max().item() == pytest.approx(2.236, abs=1e-3)
     assert not torch.allclose(counterfactual[:2], advantages[0][response[0]])
+
+
+def test_mask_groups_without_reward_signal_masks_only_uniform_groups():
+    # Three prompt groups of two rollouts: all zero, mixed, all one.
+    batch = BatchedDataDict(
+        {
+            "total_reward": torch.tensor([0.0, 0.0, 0.0, 0.5, 1.0, 1.0]),
+            "loss_multiplier": torch.ones(6),
+        }
+    )
+    prompt_ids = torch.tensor([[0], [0], [1], [1], [2], [2]])
+    assert grpo_mod._mask_groups_without_reward_signal(batch, prompt_ids) == 2
+    assert batch["loss_multiplier"].tolist() == [0.0, 0.0, 1.0, 1.0, 0.0, 0.0]
+
+
+def test_mask_groups_without_reward_signal_keeps_rows_when_no_group_has_signal():
+    batch = BatchedDataDict({"total_reward": torch.zeros(4), "loss_multiplier": torch.ones(4)})
+    prompt_ids = torch.tensor([[0], [0], [1], [1]])
+    assert grpo_mod._mask_groups_without_reward_signal(batch, prompt_ids) == 2
+    assert batch["loss_multiplier"].tolist() == [1.0, 1.0, 1.0, 1.0]

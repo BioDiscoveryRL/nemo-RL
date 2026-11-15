@@ -189,9 +189,12 @@ class AsyncTrajectoryCollector:
             )
             self._debug_payload_metrics = algorithm_config.debug_payload_metrics
             self._max_generation_failures = async_config.max_generation_failures
-            # Dynamic sampling in async mode: prompt groups without reward signal are not buffered, so gap-filling
-            # replaces them and every training batch keeps num_prompts_per_step groups with signal.
-            self._drop_groups_without_signal = algorithm_config.use_dynamic_sampling
+            # Refill dynamic sampling in async mode: prompt groups without reward signal are not buffered, so
+            # gap-filling replaces them and every training batch keeps num_prompts_per_step groups with signal.
+            # Without refill, every group is buffered and the trainer masks the ones without signal.
+            self._drop_groups_without_signal = (
+                algorithm_config.use_dynamic_sampling and algorithm_config.dynamic_sampling_refill
+            )
             self._max_consecutive_dropped_groups = (
                 algorithm_config.dynamic_sampling_max_gen_batches * int(algorithm_config.num_prompts_per_step)
             )

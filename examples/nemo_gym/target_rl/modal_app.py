@@ -78,8 +78,10 @@ image = (
     .add_local_dir(NEMO_RL.parent / "generator", f"{GYM_WORKSPACE}/generator", ignore=IGNORE, copy=True)
     .run_commands(
         UV_SYNC,
-        # Adds the copied NeMo Gym to the actor venvs that need it; everything else is already installed.
-        f"bash {BUILD_ACTOR_VENVS} {ACTOR_ENVIRONMENTS}",
+        # Second half of the actor venv build, as in docker/Dockerfile's release stage: the editable nemo_rl and
+        # nemo_gym installs and the python-<Actor> wrappers, now that the source is here. The first half (every
+        # third-party package) ran in the dependency layer.
+        "UV_LINK_MODE=hardlink uv run nemo_rl/utils/prefetch_venvs.py $(cut -f1 /tmp/actor_venvs.tsv)",
         f"chmod -R o-rwx {REMOTE_NEMO_RL} /root",
     )
 )

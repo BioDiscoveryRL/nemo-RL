@@ -32,6 +32,10 @@ grpo:
   # dynamic_sampling_max_gen_batches x num_prompts_per_step dropped groups in a row.
   use_dynamic_sampling: true
   dynamic_sampling_max_gen_batches: 10
+  # true (PRIME-RL's default): replace dropped groups, so every step trains on num_prompts_per_step groups, at the
+  # cost of extra generation when many groups have no signal. false: train on the groups with signal from each
+  # step's batch as generated, so a step never waits on replacements (fewer groups when many score alike).
+  dynamic_sampling_refill: true
   async_grpo:
     enabled: true
     max_trajectory_age_steps: 1
