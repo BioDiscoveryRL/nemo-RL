@@ -52,6 +52,10 @@ BUILD_ACTOR_VENVS = "/opt/target_rl/build_actor_venvs.sh"
 dependencies_image = (
     modal.Image.from_registry("nvcr.io/nvidia/nemo-rl:v0.8.0")
     .entrypoint([])
+    # Copying a checkout over the release image's own merges the trees, leaving files the checkout no longer has
+    # (a stale requirements.txt beside a pyproject.toml breaks NeMo Gym's server setup). Clear the release image's
+    # source first; this layer and the code layer below bring in this checkout's.
+    .run_commands(f"find {REMOTE_NEMO_RL} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +")
     .add_local_file(NEMO_RL / "pyproject.toml", f"{REMOTE_NEMO_RL}/pyproject.toml", copy=True)
     .add_local_file(NEMO_RL / "uv.lock", f"{REMOTE_NEMO_RL}/uv.lock", copy=True)
     .add_local_file(NEMO_RL / ".python-version", f"{REMOTE_NEMO_RL}/.python-version", copy=True)
