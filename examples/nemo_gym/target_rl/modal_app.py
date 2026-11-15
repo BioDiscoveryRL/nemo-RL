@@ -44,6 +44,7 @@ NEMO_GYM = NEMO_RL.parent / "nemogym"
 # Local build products, caches and per-server virtualenvs stay out of the image (uv rebuilds them in the container),
 # and so does env.yaml, which holds local endpoint credentials.
 IGNORE = [".git", "**/.venv", "**/__pycache__", "results", "logs", ".cache", "cache", "**/*.egg-info", "env.yaml"]
+UV_VERSION = "0.13.6"
 UV_SYNC = "uv sync --frozen --all-groups --extra nemo_gym"
 ACTOR_ENVIRONMENTS = "/opt/target_rl/actor_environments.py"
 BUILD_ACTOR_VENVS = "/opt/target_rl/build_actor_venvs.sh"
@@ -56,6 +57,11 @@ dependencies_image = (
     # (a stale requirements.txt beside a pyproject.toml breaks NeMo Gym's server setup). Clear the release image's
     # source first; this layer and the code layer below bring in this checkout's.
     .run_commands(f"find {REMOTE_NEMO_RL} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +")
+    # The release image's uv is older than the `required-version` in NeMo Gym's pyprojects; use the version
+    # docker/Dockerfile pins (UV_VERSION).
+    .run_commands(
+        f"curl -LsSf https://astral.sh/uv/{UV_VERSION}/install.sh | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh"
+    )
     .add_local_file(NEMO_RL / "pyproject.toml", f"{REMOTE_NEMO_RL}/pyproject.toml", copy=True)
     .add_local_file(NEMO_RL / "uv.lock", f"{REMOTE_NEMO_RL}/uv.lock", copy=True)
     .add_local_file(NEMO_RL / ".python-version", f"{REMOTE_NEMO_RL}/.python-version", copy=True)
