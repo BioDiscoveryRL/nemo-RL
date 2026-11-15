@@ -1763,6 +1763,9 @@ class AsyncTrajectoryCollector:
         if self._drop_groups_without_signal:
             if not has_reward_signal(final_batch_cpu["total_reward"]):
                 self._drop_group_without_signal(rollout_result, final_batch_cpu, input_task_index)
+                # Resolved for this batch: the retry loop must not regenerate it. The buffer's shortfall makes
+                # gap-filling generate a replacement from the next prompts instead.
+                buffered_group_indices.add(rollout_result.group_index)
                 return
             with self._dropped_groups_lock:
                 self._consecutive_dropped_groups = 0
