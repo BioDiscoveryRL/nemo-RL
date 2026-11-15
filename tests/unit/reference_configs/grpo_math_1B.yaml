@@ -28,6 +28,7 @@ grpo:
   seed: 42
   use_dynamic_sampling: false
   dynamic_sampling_max_gen_batches: 10
+  dynamic_sampling_refill: true  # false (async GRPO only): train on the groups with signal, no replacement
   batch_multiplier: 1
   reward_shaping:
     enabled: false

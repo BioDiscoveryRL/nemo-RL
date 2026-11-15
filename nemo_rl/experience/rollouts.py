@@ -2471,6 +2471,9 @@ def _prepare_nemo_gym_rows(
             else configured_max_tokens
         )
         row["_rowidx"] = row_index
+        # Gym's Environment Servers key episodes by task and rollout index. The async collector stamps each training
+        # row's dataloader ordinal; rows without one (validation) use their prompt group's position in this batch.
+        row.setdefault(NEMO_GYM_TASK_INDEX_KEY, group_index)
         row[NEMO_GYM_GROUP_ID_KEY] = group_ids[group_index]
         row[NEMO_GYM_GROUP_ATTEMPT_KEY] = group_attempts[group_index]
         row[NEMO_GYM_ROLLOUT_INDEX_KEY] = rollout_index

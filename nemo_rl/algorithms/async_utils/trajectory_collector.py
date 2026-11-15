@@ -83,6 +83,14 @@ TokenizerType = PreTrainedTokenizerBase
 _MAX_NEMO_GYM_STREAM_RETRIES = 3
 _NEMO_GYM_RETRY_DELAY_BASE_SECONDS = 1.0
 _REPLAY_BUFFER_MAX_BACKOFF_SECONDS = 0.5
+
+
+def has_reward_signal(total_reward: torch.Tensor) -> bool:
+    """Whether a prompt group's rollouts differ in reward, so some rollout gets a nonzero group-relative advantage.
+
+    The same exact-equality test the synchronous dynamic sampling applies per prompt.
+    """
+    return total_reward.numel() > 1 and not bool(torch.all(total_reward == total_reward[0]))
 # How often telemetry teardown re-releases the collection loop's pause events
 # while waiting for it to exit. Short enough that the loop is not held for a
 # meaningful slice of the quiesce budget, long enough not to spin.
@@ -181,6 +189,15 @@ class AsyncTrajectoryCollector:
             )
             self._debug_payload_metrics = algorithm_config.debug_payload_metrics
             self._max_generation_failures = async_config.max_generation_failures
+            # Refill dynamic sampling in async mode: prompt groups without reward signal are not buffered, so
+            # gap-filling replaces them and every training batch keeps num_prompts_per_step groups with signal.
+            # Without refill, every group is buffered and the trainer masks the ones without signal.
+            self._drop_groups_without_signal = (
+                algorithm_config.use_dynamic_sampling and algorithm_config.dynamic_sampling_refill
+            )
+            self._max_consecutive_dropped_groups = (
+                algorithm_config.dynamic_sampling_max_gen_batches * int(algorithm_config.num_prompts_per_step)
+            )
             # Matches the driver-side span the sync path opens, so a rollout
             # reads the same on either path. Spelled per branch rather than
             # interpolated so both names stay greppable from the emit site.
@@ -191,6 +208,8 @@ class AsyncTrajectoryCollector:
             self._deduplicate_multimodal_data = False
             self._debug_payload_metrics = False
             self._max_generation_failures = 0
+            self._drop_groups_without_signal = False
+            self._max_consecutive_dropped_groups = 0
             self._rollout_span_name = "rl.ppo.generation"
         else:
             raise TypeError(
@@ -220,6 +239,11 @@ class AsyncTrajectoryCollector:
         self._teacher_locks: dict[str, _threading.Lock] = {
             k: _threading.Lock() for k in self.teacher_worker_groups
         }
+        self._consecutive_dropped_groups = 0
+        # Groups dropped and kept since the trainer last read them (pop_dynamic_sampling_metrics).
+        self._dropped_groups_since_report = 0
+        self._kept_groups_since_report = 0
+        self._dropped_groups_lock: _threading.Lock = _threading.Lock()
         self.running = False
         self.data_exhausted = False
         self.collection_failed = False
@@ -553,7 +577,11 @@ class AsyncTrajectoryCollector:
                         ),
                         self._efficiency_timer.time("idle/generation_limit_pause"),
                     ):
-                        self._generation_limit_cleared.wait()
+                        # With refill dynamic sampling, also re-check periodically: a worker's wake-up that lands
+                        # between the pause check and clear() above would otherwise be lost.
+                        self._generation_limit_cleared.wait(
+                            timeout=30.0 if self._drop_groups_without_signal else None
+                        )
 
                     # Double-check we're still running after being woken up
                     if not self.running:
@@ -1182,6 +1210,18 @@ class AsyncTrajectoryCollector:
             self._efficiency_timer.get_timing_metrics(reduction_op="sum"),
         )
 
+    def pop_dynamic_sampling_metrics(self) -> dict[str, int]:
+        """Return and reset the prompt groups dropped and kept by refill dynamic sampling since the last call."""
+        with self._dropped_groups_lock:
+            metrics = {
+                "dropped_groups": self._dropped_groups_since_report,
+                "kept_groups": self._kept_groups_since_report,
+                "consecutive_dropped_groups": self._consecutive_dropped_groups,
+            }
+            self._dropped_groups_since_report = 0
+            self._kept_groups_since_report = 0
+        return metrics
+
     def flush_telemetry(self, quiesce_timeout_s: float = 5.0) -> None:
         """Stop collecting, then export whatever spans are still buffered here.
 
@@ -1596,6 +1636,10 @@ class AsyncTrajectoryCollector:
             with self._failure_lock:
                 if self._fatal_error_message is None:
                     self._failure_count = 0
+            # Groups dropped for no reward signal leave the target short. Wake the collection loop once this
+            # reservation is released, so it gap-fills the target instead of waiting for a weight update that
+            # cannot come until the target is complete.
+            wake_generation_limits_after_cleanup = self._drop_groups_without_signal
         except Exception as error:
             if not self.running:
                 return
@@ -1682,6 +1726,35 @@ class AsyncTrajectoryCollector:
 
         return task_index_to_group_index
 
+    def _drop_group_without_signal(
+        self,
+        rollout_result: RolloutGroupResult,
+        final_batch_cpu: BatchedDataDict[Any],
+        input_task_index: Optional[int],
+    ) -> None:
+        """Skip a group whose rollouts all scored the same; the buffer's shortfall makes gap-filling replace it."""
+        with self._dropped_groups_lock:
+            self._consecutive_dropped_groups += 1
+            self._dropped_groups_since_report += 1
+            dropped = self._consecutive_dropped_groups
+        if dropped > self._max_consecutive_dropped_groups:
+            raise RuntimeError(
+                f"{dropped} consecutive prompt groups had identical rewards across all rollouts, more than "
+                f"grpo.dynamic_sampling_max_gen_batches x grpo.num_prompts_per_step = "
+                f"{self._max_consecutive_dropped_groups}. The tasks give no learning signal at this policy."
+            )
+        group_task_index = rollout_result.task_index if rollout_result.task_index is not None else input_task_index
+        if group_task_index is not None:
+            # Resolved, not pending: the resume frontier must not wait for it.
+            with self._outstanding_lock:
+                self._outstanding_task_indices.discard(int(group_task_index))
+        reward = float(final_batch_cpu["total_reward"][0])
+        print(
+            f"🗑️ Dropped prompt group (group_index={rollout_result.group_index}, task_index={group_task_index}): "
+            f"every rollout scored {reward:g}, so no advantage; gap-filling replaces it "
+            f"[{dropped} consecutive]"
+        )
+
     async def _enqueue_rollout_group(
         self,
         rollout_result: RolloutGroupResult,
@@ -1695,6 +1768,16 @@ class AsyncTrajectoryCollector:
         """Push one prompt group to the replay buffer with bounded backoff."""
         final_batch_cpu = rollout_result.final_batch.to("cpu")
         rollout_metrics = rollout_result.rollout_metrics
+        if self._drop_groups_without_signal:
+            if not has_reward_signal(final_batch_cpu["total_reward"]):
+                self._drop_group_without_signal(rollout_result, final_batch_cpu, input_task_index)
+                # Resolved for this batch: the retry loop must not regenerate it. The buffer's shortfall makes
+                # gap-filling generate a replacement from the next prompts instead.
+                buffered_group_indices.add(rollout_result.group_index)
+                return
+            with self._dropped_groups_lock:
+                self._consecutive_dropped_groups = 0
+                self._kept_groups_since_report += 1
 
         # Teacher inference is blocking. Keep it off this worker's event loop so
         # other completed prompt groups can continue moving toward the buffer.

@@ -433,6 +433,10 @@ class GRPOConfig(BaseModel, extra="allow"):
     # When using dynamic sampling, the maximum number of batches to generate
     # before throwing an error
     dynamic_sampling_max_gen_batches: int = 10
+    # When using dynamic sampling: true replaces discarded prompt groups with newly generated ones, so every step
+    # trains on num_prompts_per_step groups with reward variation; false trains on the groups with variation from
+    # each step's batch as it is (fewer when some have none). false is implemented for async GRPO only.
+    dynamic_sampling_refill: bool = True
     # When using dynamic sampling, generation prompt batch size will equal
     # num_prompts_per_step * batch_multiplier
     batch_multiplier: float = 1.0
@@ -881,6 +885,13 @@ def setup(
         dataloader_batch_size = data_config["num_prompts_per_dataloader"]
     else:
         dataloader_batch_size = num_prompts_per_step
+
+    # Validate the no-refill dynamic sampling mode, which only the async loop implements
+    if grpo_config.use_dynamic_sampling and not grpo_config.dynamic_sampling_refill:
+        assert grpo_config.async_grpo is not None and grpo_config.async_grpo.enabled, (
+            "grpo.dynamic_sampling_refill=false is implemented for async GRPO only; set "
+            "grpo.async_grpo.enabled=true or grpo.dynamic_sampling_refill=true"
+        )
 
     # Validate batch_multiplier
     batch_multiplier = grpo_config.batch_multiplier
@@ -2781,6 +2792,59 @@ def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int
     loss_multiplier[mask_sample_bool] = 0
     repeated_batch["loss_multiplier"] = loss_multiplier
     return num_masked
+
+
+# Above this share of dropped groups, refill needs more than twice the rollouts per training step.
+DYNAMIC_SAMPLING_LAG_WARNING_FRACTION = 0.5
+
+
+def _dynamic_sampling_lag_metrics(counts: dict[str, int]) -> dict[str, float]:
+    """Turn the collector's dropped/kept group counts into train metrics, warning when refill slows steps down.
+
+    ``rollouts_per_kept_group`` is how many prompt groups were generated per group trained on: 1.0 means no
+    group was dropped, 3.0 means each step waited for three times the rollouts it trains on.
+    """
+    dropped, kept = counts["dropped_groups"], counts["kept_groups"]
+    generated = dropped + kept
+    drop_fraction = dropped / generated if generated else 0.0
+    rollouts_per_kept_group = generated / kept if kept else float(generated)
+    if drop_fraction > DYNAMIC_SAMPLING_LAG_WARNING_FRACTION:
+        print(
+            f"  ⚠️ Dynamic sampling lag: dropped {dropped} of {generated} prompt groups since the last step "
+            f"({drop_fraction:.0%}), {rollouts_per_kept_group:.1f}x the rollouts per trained group; "
+            f"{counts['consecutive_dropped_groups']} consecutive drops so far",
+            flush=True,
+        )
+    return {
+        "dynamic_sampling/dropped_groups": dropped,
+        "dynamic_sampling/kept_groups": kept,
+        "dynamic_sampling/drop_fraction": drop_fraction,
+        "dynamic_sampling/rollouts_per_kept_group": rollouts_per_kept_group,
+        "dynamic_sampling/consecutive_dropped_groups": counts["consecutive_dropped_groups"],
+    }
+
+
+def _mask_groups_without_reward_signal(
+    repeated_batch: BatchedDataDict[DatumSpec], prompt_ids: torch.Tensor
+) -> int:
+    """Zero ``loss_multiplier`` for every row of a prompt group whose rewards are all equal; return how many groups.
+
+    Uses the same exact-equality test as synchronous dynamic sampling. ``prompt_ids`` is the ``[B, 1]`` group label
+    of each row (``_trajectory_group_ids``). When no group has signal the mask is left as is: every advantage is
+    already zero, and masking every row would leave the loss without tokens.
+    """
+    rewards = repeated_batch["total_reward"]
+    group_of_row = prompt_ids.view(-1)
+    groups = torch.unique(group_of_row)
+    without_signal = [g for g in groups if bool(torch.all(rewards[group_of_row == g] == rewards[group_of_row == g][0]))]
+    if len(without_signal) == len(groups):
+        print("  ⚠️ No prompt group in this batch has reward signal; the step has zero advantage everywhere")
+        return len(without_signal)
+    loss_multiplier = repeated_batch["loss_multiplier"].clone()
+    for g in without_signal:
+        loss_multiplier[group_of_row == g] = 0
+    repeated_batch["loss_multiplier"] = loss_multiplier
+    return len(without_signal)
 
 
 def _apply_async_sample_masks(
@@ -5969,6 +6033,20 @@ def async_grpo_train(
                         f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
                     )
 
+                    num_groups_without_signal = 0
+                    if (
+                        master_config.grpo.use_dynamic_sampling
+                        and not master_config.grpo.dynamic_sampling_refill
+                    ):
+                        # No-refill dynamic sampling: groups whose rollouts all scored the same leave the loss
+                        # and its token count, and the step trains on the groups with signal.
+                        num_groups_without_signal = _mask_groups_without_reward_signal(
+                            repeated_batch, prompt_ids_for_adv
+                        )
+                        print(
+                            f"  🗑️ Masked {num_groups_without_signal} prompt groups without reward signal"
+                        )
+
                 # Prepare training data (same as sync version)
                 with (
                     timer.time("data_processing"),
@@ -6422,6 +6500,7 @@ def async_grpo_train(
                     LOSS_KEY: train_results["loss"].numpy(),
                     REWARD_KEY: rewards.numpy(),
                     "num_mask_sample_filtered": num_mask_sample_filtered,
+                    "num_groups_without_signal": num_groups_without_signal,
                     **sample_mask_metrics,
                     GRAD_NORM_KEY: train_results["grad_norm"].numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
@@ -6733,6 +6812,15 @@ def async_grpo_train(
             collector_efficiency = ray.get(
                 trajectory_collector.get_efficiency_metrics.remote()
             )
+            if (
+                master_config.grpo.use_dynamic_sampling
+                and master_config.grpo.dynamic_sampling_refill
+            ):
+                metrics.update(
+                    _dynamic_sampling_lag_metrics(
+                        ray.get(trajectory_collector.pop_dynamic_sampling_metrics.remote())
+                    )
+                )
             driver_efficiency = {
                 cat: timer.reduce(cat, "sum")
                 for cat in WALL_CLOCK_EFFICIENCY_CATEGORIES

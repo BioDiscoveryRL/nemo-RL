@@ -1,0 +1,51 @@
+# Overfitting test: base GRPO on our harness (simple_agent + one bash tool) over the 12 overfit tasks.
+# The question is whether target-discovery F1 on those 12 tasks rises with training; the 6 held-out tasks are
+# validation. Reward = tasks.scoring F1 of the committed run_summary.json (biodiscovery resources server).
+#
+# Needs a Docker daemon with the toolkit image (resources_servers/biodiscovery/toolkit), the worlds at
+# $BDRL_WORLDS_ROOT on the host, and the task rows built by target_rl/scripts/harbor_to_jsonl.py (paths relative to
+# 3rdparty/Gym-workspace/Gym).
+
+defaults: "grpo_qwen3.8_27b_1n8g.yaml"
+
+grpo:
+  num_prompts_per_step: 12
+  num_generations_per_prompt: 8
+  max_num_steps: 60
+  val_period: 5
+  val_at_start: true
+
+checkpointing:
+  checkpoint_dir: results/target-rl-biodiscovery-overfit
+  save_period: 5
+
+policy:
+  # An episode is up to 40 tool calls with thinking; tool output is capped at 8k characters per call.
+  max_total_sequence_length: 65536
+  megatron_cfg:
+    optimizer:
+      # LoRA needs a much higher rate than full fine-tuning (base recipes use 5e-6); aggressive on purpose for the
+      # overfitting test.
+      lr: 1.0e-4
+    scheduler:
+      # The base recipe warms up over 13 steps from 5e-7, a fifth of this run.
+      lr_warmup_iters: 3
+
+data:
+  train:
+    data_path: 3rdparty/Gym-workspace/Gym/target_rl/data/biodiscovery/train.jsonl
+  validation:
+    data_path: 3rdparty/Gym-workspace/Gym/target_rl/data/biodiscovery/validation.jsonl
+
+env:
+  nemo_gym:
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/biodiscovery/configs/biodiscovery.yaml
+      # One sandbox per episode with no network; swap this file to change the sandbox runtime.
+      - target_rl/configs/sandbox_docker.yaml
+
+logger:
+  log_dir: logs/target-rl-biodiscovery-overfit
+  wandb:
+    name: qwen3.8-27b-biodiscovery-overfit
