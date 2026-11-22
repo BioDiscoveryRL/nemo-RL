@@ -3526,15 +3526,21 @@ def _postprocess_single_nemo_gym_group(
 
     group_task_index = None
     if nemo_gym_rows and NEMO_GYM_TASK_INDEX_KEY in nemo_gym_rows[0]:
-        group_task_index = int(nemo_gym_rows[0][NEMO_GYM_TASK_INDEX_KEY])
         task_indices = [row.get(NEMO_GYM_TASK_INDEX_KEY) for row in nemo_gym_rows]
-        if any(
-            task_index is None or int(task_index) != group_task_index
-            for task_index in task_indices
-        ):
-            raise ValueError(
-                f"Expected one _ng_task_index per prompt group, got {task_indices}"
-            )
+        # The synchronous path hands the whole batch in as one call (several prompt groups of group_size rows), so
+        # check each prompt group separately; only a single-group call has one task index to report.
+        prompt_group_size = group_size or len(task_indices)
+        for start in range(0, len(task_indices), prompt_group_size):
+            prompt_group = task_indices[start : start + prompt_group_size]
+            if any(
+                task_index is None or int(task_index) != int(prompt_group[0])
+                for task_index in prompt_group
+            ):
+                raise ValueError(
+                    f"Expected one _ng_task_index per prompt group, got {task_indices}"
+                )
+        if prompt_group_size >= len(task_indices):
+            group_task_index = int(task_indices[0])
 
     return NemoGymRolloutResult(
         input_ids=input_ids,

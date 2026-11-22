@@ -1,0 +1,105 @@
+# DRAFT, NOT YET RUN. Overfit test on a shared box with 4 free GPUs: Qwen3.8-27B (thinking, LoRA), same 4 tasks x 8 and
+# the same fixes as grpo_qwen3.5_9b_biodiscovery_overfit4_4g.yaml (the 9B scored 0 on all 320 rollouts; the 27B baseline
+# has non-zero F1 on all 4 tasks). Colocated: Megatron TP4 + vLLM TP2 x 2 on the same 4 GPUs.
+# Deviation from the environment spec: command_timeout_seconds 300 (was 600) to cut straggler-bound step time.
+#
+# Launch with CUDA_VISIBLE_DEVICES set to the 4 GPUs (see results/README.md on the box).
+# Layout: synchronous and colocated. Megatron trains with TP4 on all 4 GPUs; vLLM (TP1, four replicas) generates on
+# the same GPUs and sleeps during training. The async 2+2 split (grpo_qwen3.5_9b_biodiscovery_overfit4_async2p2.yaml,
+# Megatron TP2 on 2 GPUs) passed the 32k quick check but ran out of memory in its first 64k training step (bf16 logits
+# plus their gradient alone are ~32 GiB per rank at TP2).
+# The 4-task subset (train_overfit4.jsonl) is cut from train.jsonl by bin/make_subset.py.
+# Episode sandboxes are capped at 32 concurrent, 2 CPUs and 8 GiB each.
+
+defaults: "grpo_qwen3.8_27b_biodiscovery_overfit.yaml"
+
+grpo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 8
+  max_num_epochs: null
+  max_num_steps: 20
+  # Every step trains on the full 4 x 8 batch: groups whose rollouts all score the same get zero advantage under
+  # Dr. GRPO. Dynamic sampling without refill (mask such groups) exists for async GRPO only, and refill would
+  # regenerate whole groups; the logged batch reward is then an unfiltered overfit curve.
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 30
+  async_grpo:
+    enabled: false
+  # Validation off: the held-out tasks are not part of this test.
+  val_period: 1000
+  val_at_start: false
+  val_at_end: false
+
+checkpointing:
+  checkpoint_dir: results/overfit4-27b
+  metric_name: null
+  save_period: 10
+  keep_top_k: 2
+
+policy:
+  model_name: Qwen/Qwen3.8-27B
+  # At 32k every quick-check episode ran out of context after 15-35 tool calls without committing (reward 0);
+  # 64k is the base overfit recipe's length and fits a 40-call episode.
+  max_total_sequence_length: 65536
+  # Full-vocab fp32 logits at 32k tokens were 15 GiB per TP rank (OOM in get_logprobs); compute them in chunks.
+  logprob_chunk_size: 4096
+  megatron_cfg:
+    tensor_model_parallel_size: 4
+    # Qwen3.5 checkpoints carry a Multi-Token-Prediction layer; Megatron computes its loss (full fp32 logits, 30 GiB per
+    # rank at 64k) even in get_logprobs. RL does not use it: disable MTP (as grpo_math_1B.yaml does).
+    mtp_num_layers: 0
+    mtp_loss_scaling_factor: 0.0
+    # With overlap_grad_reduce the DDP buckets count backward hooks per param; the LoRA adapters of the vision tower
+    # never get a gradient on text-only batches, so step 2 failed (param_and_grad_buffer.py: assert
+    # len(per_param_grad_ready_counts) == len(params)). Single data-parallel rank here (TP4, DP1): nothing to overlap.
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+    peft:
+      dim: 64
+      alpha: 64
+  generation:
+    colocated:
+      enabled: true
+    vllm_cfg:
+      tensor_parallel_size: 2
+      # Shares the GPU with the offloaded Megatron model. Only 8 of Qwen3.5's 32 layers use full attention, so the KV
+      # cache for 8 x 64k sequences per replica fits easily.
+      # 27B bf16 is ~27 GB per GPU at TP2; Megatron is offloaded during generation.
+      gpu_memory_utilization: 0.7
+
+data:
+  train:
+    data_path: 3rdparty/Gym-workspace/Gym/target_rl/data/biodiscovery/train_overfit4.jsonl
+
+env:
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    biodiscovery:
+      resources_servers:
+        biodiscovery:
+          sandbox_resources:
+            cpu: 2
+            memory_mib: 8192
+          # Deviation: 300 s instead of 600 s per command.
+          command_timeout_seconds: 300
+    biodiscovery_environment_server:
+      environment_servers:
+        single_agent_turn_legacy:
+          max_concurrent_episodes: 32
+          queue_timeout_seconds: 36000
+    sandbox:
+      docker:
+        exec:
+          concurrency: 48
+
+logger:
+  log_dir: logs/overfit4-27b
+  wandb_enabled: false
+  tensorboard_enabled: true
+  wandb:
+    name: qwen3.8-27b-biodiscovery-overfit4
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1

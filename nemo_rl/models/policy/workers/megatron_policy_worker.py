@@ -901,7 +901,11 @@ class MegatronPolicyWorkerImpl(
         # Must be the first CUDA-touching call in this process.
         # With `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1` (set by `configure_worker()`),
         gpu_ids = ray.get_gpu_ids()
-        local_rank = int(gpu_ids[0])
+        physical_gpu = int(gpu_ids[0])
+        # Ray's GPU id is the physical index. When the cluster was started with CUDA_VISIBLE_DEVICES set to a
+        # subset (a shared box, e.g. 0,2,6,7), the CUDA ordinal is that id's position in the list.
+        visible = [d.strip() for d in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if d.strip()]
+        local_rank = visible.index(str(physical_gpu)) if str(physical_gpu) in visible else physical_gpu
         os.environ["LOCAL_RANK"] = str(local_rank)
         # Batch-invariant / zero-KL kernels must be enabled before CUDA init.
         enable_batch_invariant_mode(config)
@@ -916,7 +920,7 @@ class MegatronPolicyWorkerImpl(
         # keys the affinity file. Pass it explicitly: CUDA_VISIBLE_DEVICES lists
         # all node devices here (RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1,
         # set by configure_worker), so it can't identify this worker's GPU.
-        bind_to_gpu_numa(local_rank)
+        bind_to_gpu_numa(physical_gpu)
 
         # OTel providers are process-global, so the driver's setup does not
         # reach this actor. No-op unless telemetry is enabled.
