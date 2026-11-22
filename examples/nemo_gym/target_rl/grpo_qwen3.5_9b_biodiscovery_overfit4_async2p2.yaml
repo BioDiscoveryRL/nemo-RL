@@ -1,0 +1,91 @@
+# Smoke / overfit test on a shared box with 4 free GPUs: Qwen3.5-9B (thinking, LoRA) on 4 biodiscovery tasks repeated in
+# every batch (4 prompts x 8 generations). Derived from grpo_qwen3.8_27b_biodiscovery_overfit.yaml.
+#
+# ASYNC 2+2 VARIANT (kept for reference): passed the 32k quick check, but its first 64k training step ran out of
+# memory on the 2 training GPUs; the overfit run uses grpo_qwen3.5_9b_biodiscovery_overfit4_4g.yaml (colocated, TP4).
+# Layout (launch with CUDA_VISIBLE_DEVICES set to the 4 GPUs): 2 GPUs train (Megatron TP2), 2 GPUs generate (vLLM TP1,
+# two replicas), async GRPO as in the base recipe.
+# The 4-task subset (train_overfit4.jsonl) is written by the launcher from train.jsonl; see results/README.md.
+# Episode sandboxes are capped at 32 concurrent, 2 CPUs and 8 GiB each.
+
+defaults: "grpo_qwen3.8_27b_biodiscovery_overfit.yaml"
+
+grpo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 8
+  max_num_epochs: null
+  max_num_steps: 30
+  dynamic_sampling_max_gen_batches: 30
+  # No refill: every step generates exactly 4 x 8 rollouts and masks the groups whose rollouts all scored the same,
+  # so the logged batch reward is unfiltered (a clean overfit curve) and no step waits on regenerated groups.
+  dynamic_sampling_refill: false
+  # Validation off: the held-out tasks are not part of this test.
+  val_period: 1000
+  val_at_start: false
+  val_at_end: false
+
+checkpointing:
+  checkpoint_dir: results/overfit4
+  metric_name: null
+  save_period: 10
+  keep_top_k: 2
+
+policy:
+  model_name: Qwen/Qwen3.5-9B
+  # At 32k every quick-check episode ran out of context after 15-35 tool calls without committing (reward 0);
+  # 64k is the base overfit recipe's length and fits a 40-call episode.
+  max_total_sequence_length: 65536
+  # Full-vocab fp32 logits at 32k tokens were 15 GiB per TP rank (OOM in get_logprobs); compute them in chunks.
+  logprob_chunk_size: 4096
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    # Qwen3.5 checkpoints carry a Multi-Token-Prediction layer; Megatron computes its loss (full fp32 logits, 30 GiB per
+    # rank at 64k) even in get_logprobs. RL does not use it: disable MTP (as grpo_math_1B.yaml does).
+    mtp_num_layers: 0
+    mtp_loss_scaling_factor: 0.0
+    peft:
+      dim: 64
+      alpha: 64
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 2
+        num_nodes: null
+    vllm_cfg:
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.85
+
+data:
+  train:
+    data_path: 3rdparty/Gym-workspace/Gym/target_rl/data/biodiscovery/train_overfit4.jsonl
+
+env:
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    biodiscovery:
+      resources_servers:
+        biodiscovery:
+          sandbox_resources:
+            cpu: 2
+            memory_mib: 8192
+    biodiscovery_environment_server:
+      environment_servers:
+        single_agent_turn_legacy:
+          max_concurrent_episodes: 32
+          queue_timeout_seconds: 36000
+    sandbox:
+      docker:
+        exec:
+          concurrency: 48
+
+logger:
+  log_dir: logs/overfit4
+  wandb_enabled: false
+  tensorboard_enabled: true
+  wandb:
+    name: qwen3.5-9b-biodiscovery-overfit4
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1

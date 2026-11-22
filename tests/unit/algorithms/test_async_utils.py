@@ -4285,3 +4285,17 @@ def test_turn_count_fallback_priority():
     assert f({"turns_per_sample/max": 5, "turns_per_sample/mean": 3}) == 5.0
     assert f({"turns_per_sample/mean": 6}) == 6.0
     assert f({"reward": 1.0}) is None
+
+
+@pytest.mark.parametrize(
+    ("rewards", "expected"),
+    [
+        ([0.0, 0.0, 0.0, 0.0], False),  # every rollout failed: no advantage under a group baseline
+        ([0.5, 0.5, 0.5], False),  # identical nonzero rewards: still no advantage
+        ([1.0], False),  # a single rollout has nothing to compare against
+        ([0.0, 0.0, 0.25, 0.0], True),
+        ([1.0, 0.75, 1.0], True),
+    ],
+)
+def test_has_reward_signal(rewards: list[float], expected: bool) -> None:
+    assert trajectory_collector_mod.has_reward_signal(torch.tensor(rewards)) is expected
